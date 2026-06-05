@@ -5,18 +5,33 @@
 -- CPU time spent *issuing* GL calls per widget; this one measures GPU-side cost,
 -- which is decoupled from CPU time because the GPU runs asynchronously.
 --
--- Three pure-Lua signals (no engine patch required):
---   1. VRAM used/total           -- Spring.GetVidMemUsage()  (always on)
---   2. GPU ms per widget draw    -- gl.Finish() brackets      (mode: time)
---   3. Overdraw (samples) /widget-- occlusion queries         (mode: overdraw)
+-- Pure-Lua, no engine patch required. Two profiling modes plus an always-on
+-- VRAM readout:
 --
--- Caveats (by design, see README block at bottom):
---   * "time" mode inserts glFinish around every hooked draw call-in, which
---     serializes CPU<->GPU. Absolute frame times are INFLATED while it runs;
---     it is a diagnostic mode, not always-on telemetry. Relative attribution
---     between widgets stays meaningful, which is what finds the hog.
---   * VRAM is the driver's global view (no per-resource attribution) and is
---     unavailable on Intel.
+--   * "widget" mode  -- per-widget CPU/GPU ms for each draw call-in, via
+--                       gl.Finish() brackets. Finds which WIDGET is heavy.
+--                       Inserts a glFinish around every hooked draw call-in,
+--                       which serializes CPU<->GPU: absolute frame times are
+--                       INFLATED while it runs. It is a diagnostic mode, not
+--                       always-on telemetry. Relative attribution between
+--                       widgets stays meaningful, which is what finds the hog.
+--
+--   * "overall" mode -- ONE glFinish at the very end of the frame measures the
+--                       whole-frame GPU "tail": engine (CWorldDrawer) + all
+--                       widgets. ~0 when CPU-bound, ~= total GPU frame time when
+--                       GPU-bound. Use this first to decide CPU-bound vs
+--                       GPU-bound, and whether the cost is the engine or a
+--                       widget. Cheap: one finish/frame, no per-widget serialize.
+--
+--   * VRAM used/total via Spring.GetVidMemUsage() (driver-global, no per-resource
+--     attribution; unavailable on Intel).
+--
+--   * VRAM pressure / paging: on NVIDIA we read the NVX eviction counters (via
+--     the raw gl.GetNumber passthrough). When the driver is evicting resources
+--     from VRAM the line turns red -- that means bad GPU perf is caused by VRAM
+--     being full (thrashing over PCIe), which the used/total number alone cannot
+--     tell you. AMD/Mesa lack the counter, so it falls back to a "near full"
+--     heuristic; Intel has neither.
 --------------------------------------------------------------------------------
 
 local widget = widget ---@type Widget
@@ -24,11 +39,11 @@ local widget = widget ---@type Widget
 function widget:GetInfo()
 	return {
 		name    = "GPU Profiler",
-		desc    = "Per-widget GPU time (glFinish), overdraw (occlusion queries) and live VRAM usage. Console: /gpuprofiler",
-		author  = "BAR",
+		desc    = "Per-widget GPU time (widget mode), whole-frame GPU time (overall mode) and live VRAM. Console: /gpuprofiler",
+		author  = "bruno-dasilva",
 		date    = "2026",
 		license = "GNU GPL, v2 or later",
-		layer   = -1000000, -- low layer => drawn last in reverse dispatch => overlay on top
+		layer   = -1000000, -- low layer => drawn last in reverse dispatch => overlay on top, and runs after all other draws
 		handler = true,
 		enabled = false,
 	}
@@ -42,13 +57,9 @@ local spGetTimer    = Spring.GetTimer
 local spDiffTimers  = Spring.DiffTimers
 local spGetFPS      = Spring.GetFPS
 local spGetVidMem   = Spring.GetVidMemUsage
+local spGetMiniMapGeometry = Spring.GetMiniMapGeometry
 
 local glFinish      = gl.Finish
-local glCreateQuery = gl.CreateQuery
-local glDeleteQuery = gl.DeleteQuery
-local glRunQuery    = gl.RunQuery
-local glGetQuery    = gl.GetQuery
-
 local glText         = gl.Text
 local glColor        = gl.Color
 local glRect         = gl.Rect
@@ -62,7 +73,7 @@ local mathFloor  = math.floor
 local stringFormat = string.format
 local stringGmatch = string.gmatch
 local tableSort  = table.sort
-local pairs, next, type, tonumber, pcall = pairs, next, type, tonumber, pcall
+local pairs, type, tonumber = pairs, type, tonumber
 
 --------------------------------------------------------------------------------
 -- Config / state
@@ -73,12 +84,14 @@ if Spring.GetTimerMicros and Spring.GetConfigInt("UseHighResTimer", 0) == 1 then
 	highres = true
 end
 
-local overdrawSupported = (glCreateQuery ~= nil and glRunQuery ~= nil and glGetQuery ~= nil)
-
 -- profiling modes
-local MODE_OFF, MODE_TIME, MODE_OVERDRAW = 0, 1, 2
-local profMode = MODE_TIME -- starts profiling time as soon as the widget is enabled
-local modeName = { [MODE_OFF] = "off", [MODE_TIME] = "time (glFinish)", [MODE_OVERDRAW] = "overdraw (occlusion)" }
+local MODE_OFF, MODE_WIDGET, MODE_OVERALL = 0, 1, 2
+local profMode = MODE_OVERALL
+local modeName = {
+	[MODE_OFF]     = "off",
+	[MODE_WIDGET]  = "widget (per-widget glFinish)",
+	[MODE_OVERALL] = "overall (whole-frame GPU)",
+}
 
 local tick = 0.5 -- seconds between display refreshes
 local maxRows = 24
@@ -123,13 +136,38 @@ local oldInsertWidget
 -- display
 local startTimer
 local frameCount = 0
-local displayList = {} -- sorted { name, ms, samples, heaviest }
+local displayList = {} -- sorted { name, ms, cpu, heaviest }
 local totalMs = 0
-local totalSamples = 0
+local totalCpu = 0
+local frameTailSum = 0 -- accumulated whole-frame GPU tail (seconds) this window
+local frameGpuMs = 0   -- displayed avg whole-frame GPU tail (ms/frame)
+local drawStartClock     -- timer at the frame's first draw call-in (DrawGenesis)
+local drawStartValid = false
+local drawCpuSum = 0   -- accumulated draw-frame CPU (seconds) this window
+local cpuFrames = 0    -- draw frames sampled this window
+local frameCpuMs = 0   -- displayed avg draw-frame CPU (ms): DrawGenesis..DrawScreen, excludes sim
+local frameWallMs = 0  -- displayed avg draw-frame total (ms) = draw CPU + GPU tail
 
 -- VRAM
 local vramSupported = (spGetVidMem ~= nil)
 local vramUsed, vramTotal = 0, 0
+
+-- VRAM pressure / paging detection.
+-- NVIDIA exposes eviction counters via GL_NVX_gpu_memory_info. The engine's
+-- GetVidMemUsage ignores them, but we can read any GL enum through the raw
+-- glGetFloatv passthrough gl.GetNumber. The counters climb only when the driver
+-- evicts resources from VRAM to make room => paging under pressure. A rising
+-- count during gameplay is a definitive "VRAM is full and thrashing" signal,
+-- which the used/total number alone cannot tell you.
+local glGetNumber = gl.GetNumber
+local GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX = 0x904A
+local GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX = 0x904B
+local evictSupported = (glGetNumber ~= nil) and (Platform ~= nil and Platform.gpuVendor == "Nvidia")
+local prevEvictCount, prevEvictKB
+local evictCountDelta = 0
+local evictRateMBs = 0
+local paging = false
+local windowDt = tick
 
 local title_colour  = "\255\160\255\160"
 local totals_colour = "\255\200\200\255"
@@ -147,11 +185,7 @@ local function GetRecord(wname, callin)
 	if not rec then
 		rec = {
 			wname = wname, callin = callin,
-			t = 0, n = 0,            -- accumulated GPU seconds / frame-hits this window
-			samples = 0, sN = 0,     -- accumulated occlusion samples / hits this window
-			queries = nil,           -- { q0, q1 } lazily created
-			pending = { false, false },
-			slot = 1,
+			t = 0, cpu = 0, n = 0, -- accumulated GPU / CPU seconds, frame-hits this window
 		}
 		w[callin] = rec
 		recordList[#recordList + 1] = rec
@@ -160,12 +194,12 @@ local function GetRecord(wname, callin)
 end
 
 --------------------------------------------------------------------------------
--- The hook
+-- The hook (widget mode only)
 --------------------------------------------------------------------------------
 local function Hook(w, callin)
 	local wname = w.whInfo.name
 	if wname == "GPU Profiler" then
-		return w[callin] -- never profile ourselves (our glFinish/queries would nest)
+		return w[callin] -- never profile ourselves (our glFinish would nest)
 	end
 
 	local realFunc = w[callin]
@@ -173,63 +207,25 @@ local function Hook(w, callin)
 	local rec = GetRecord(wname, callin)
 
 	local function timeDone(...)
+		-- realFunc has just returned: CPU is done issuing GL commands for this pass
+		local t1 = spGetTimer()
+		rec.cpu = rec.cpu + spDiffTimers(t1, rec._t0, nil, highres)
 		glFinish() -- block until this pass has actually finished on the GPU
-		rec.t = rec.t + spDiffTimers(spGetTimer(), rec._t0, nil, highres)
+		rec.t = rec.t + spDiffTimers(spGetTimer(), t1, nil, highres)
 		rec.n = rec.n + 1
 		inHook = false
 		return ...
 	end
 
 	local function hook(...)
-		if inHook or profMode == MODE_OFF then
+		-- only the per-widget "widget" mode brackets draws; off/overall pass through
+		if inHook or profMode ~= MODE_WIDGET then
 			return realFunc(...)
 		end
 		inHook = true
-
-		if profMode == MODE_TIME then
-			glFinish() -- drain everything submitted before this widget
-			rec._t0 = spGetTimer()
-			return timeDone(realFunc(...))
-		end
-
-		-- MODE_OVERDRAW: count fragments via an occlusion query.
-		-- Double-buffered: read the result from 2 frames ago (never stalls),
-		-- because gl.GetQuery() blocks on GL_QUERY_RESULT.
-		local q = rec.queries
-		if not q then
-			local q0, q1 = glCreateQuery(), glCreateQuery()
-			if not q0 or not q1 then
-				profMode = MODE_OFF -- driver refused queries; bail safely
-				inHook = false
-				return realFunc(...)
-			end
-			q = { q0, q1 }
-			rec.queries = q
-		end
-
-		local slot = rec.slot
-		if rec.pending[slot] then
-			local samples = glGetQuery(q[slot])
-			if samples then
-				rec.samples = rec.samples + samples
-				rec.sN = rec.sN + 1
-			end
-		end
-
-		-- gl.RunQuery(q, fn, ...) runs fn(...) between glBeginQuery/glEndQuery.
-		-- It discards fn's return values, which is fine for draw call-ins.
-		local ok = pcall(glRunQuery, q[slot], realFunc, ...)
-		if not ok then
-			-- recursion/error inside the query (rare); fall back uncounted
-			realFunc(...)
-			rec.pending[slot] = false
-		else
-			rec.pending[slot] = true
-		end
-		rec.slot = (slot % 2) + 1
-
-		inHook = false
-		return
+		glFinish() -- drain everything submitted before this widget
+		rec._t0 = spGetTimer()
+		return timeDone(realFunc(...))
 	end
 
 	hookFuncs[hook] = true
@@ -305,16 +301,6 @@ local function StopHook()
 	if oldUpdateWidgetCallIn then wh.UpdateWidgetCallInRaw = oldUpdateWidgetCallIn end
 	if oldInsertWidget then wh.InsertWidgetRaw = oldInsertWidget end
 
-	-- free GPU query objects
-	for i = 1, #recordList do
-		local q = recordList[i].queries
-		if q then
-			if q[1] then glDeleteQuery(q[1]) end
-			if q[2] then glDeleteQuery(q[2]) end
-			recordList[i].queries = nil
-		end
-	end
-
 	hooked = false
 	spEcho("[GPU Profiler] unhooked")
 end
@@ -337,7 +323,7 @@ function widget:Shutdown()
 end
 
 --------------------------------------------------------------------------------
--- Console command:  /gpuprofiler [time|overdraw|off|tick <n>]
+-- Console command:  /gpuprofiler [widget|overall|off|tick <n>]
 --------------------------------------------------------------------------------
 function widget:TextCommand(s)
 	local tok = {}
@@ -347,23 +333,19 @@ function widget:TextCommand(s)
 	local arg = tok[2]
 	if arg == "off" then
 		profMode = MODE_OFF
-	elseif arg == "time" then
-		profMode = MODE_TIME
-	elseif arg == "overdraw" then
-		if overdrawSupported then
-			profMode = MODE_OVERDRAW
-		else
-			spEcho("[GPU Profiler] overdraw unsupported (no occlusion query extension)")
-		end
+	elseif arg == "widget" then
+		profMode = MODE_WIDGET
+	elseif arg == "overall" then
+		profMode = MODE_OVERALL
 	elseif arg == "tick" then
 		tick = tonumber(tok[3]) or tick
 		spEcho("[GPU Profiler] tick = " .. tick .. "s")
 	else
-		-- no/unknown arg: cycle off -> time -> overdraw -> off
+		-- no/unknown arg: cycle off -> overall -> widget -> off
 		if profMode == MODE_OFF then
-			profMode = MODE_TIME
-		elseif profMode == MODE_TIME then
-			profMode = overdrawSupported and MODE_OVERDRAW or MODE_OFF
+			profMode = MODE_OVERALL
+		elseif profMode == MODE_OVERALL then
+			profMode = MODE_WIDGET
 		else
 			profMode = MODE_OFF
 		end
@@ -372,49 +354,41 @@ function widget:TextCommand(s)
 end
 
 --------------------------------------------------------------------------------
--- Aggregate one window of samples into the sorted display list
+-- Aggregate one window into the sorted display list
 --------------------------------------------------------------------------------
 local function Flush()
 	local frames = mathMax(1, frameCount)
-	local agg = {} -- wname -> { ms, samples, heaviest, heaviestMs }
+	local agg = {} -- wname -> { ms, cpu, heaviest, heaviestMs }
 
 	for i = 1, #recordList do
 		local rec = recordList[i]
 		local a = agg[rec.wname]
 		if not a then
-			a = { ms = 0, samples = 0, heaviest = "-", heaviestMs = 0 }
+			a = { ms = 0, cpu = 0, heaviest = "-", heaviestMs = 0 }
 			agg[rec.wname] = a
 		end
 
 		local ms = (rec.t / frames) * 1000.0 -- seconds -> ms per frame
 		a.ms = a.ms + ms
+		a.cpu = a.cpu + (rec.cpu / frames) * 1000.0
 		if ms > a.heaviestMs then
 			a.heaviestMs = ms
 			a.heaviest = rec.callin
 		end
-		-- occlusion samples averaged over the hits we actually read back
-		if rec.sN > 0 then
-			a.samples = a.samples + (rec.samples / rec.sN)
-		end
 
-		rec.t, rec.n, rec.samples, rec.sN = 0, 0, 0, 0
+		rec.t, rec.cpu, rec.n = 0, 0, 0
 	end
 
 	displayList = {}
-	totalMs, totalSamples = 0, 0
+	totalMs, totalCpu = 0, 0
 	for wname, a in pairs(agg) do
 		displayList[#displayList + 1] = {
-			name = wname, ms = a.ms, samples = a.samples, heaviest = a.heaviest,
+			name = wname, ms = a.ms, cpu = a.cpu, heaviest = a.heaviest,
 		}
 		totalMs = totalMs + a.ms
-		totalSamples = totalSamples + a.samples
+		totalCpu = totalCpu + a.cpu
 	end
-
-	if profMode == MODE_OVERDRAW then
-		tableSort(displayList, function(p, q) return p.samples > q.samples end)
-	else
-		tableSort(displayList, function(p, q) return p.ms > q.ms end)
-	end
+	tableSort(displayList, function(p, q) return p.ms > q.ms end)
 
 	if vramSupported then
 		local u, t = spGetVidMem()
@@ -426,6 +400,23 @@ local function Flush()
 		end
 	end
 
+	if evictSupported then
+		local count = glGetNumber(GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX)
+		local kb = glGetNumber(GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX)
+		if count and prevEvictCount then
+			evictCountDelta = count - prevEvictCount
+			local dMB = ((kb or prevEvictKB or 0) - (prevEvictKB or 0)) / 1024.0
+			evictRateMBs = dMB / mathMax(windowDt, 0.001)
+			paging = evictCountDelta > 0 -- any new evictions this window = paging
+		end
+		prevEvictCount, prevEvictKB = count, kb
+	end
+
+	frameGpuMs = (frameTailSum / frames) * 1000.0
+	frameTailSum = 0
+	frameCpuMs = (cpuFrames > 0) and ((drawCpuSum / cpuFrames) * 1000.0) or 0
+	frameWallMs = frameCpuMs + frameGpuMs
+	drawCpuSum, cpuFrames = 0, 0
 	frameCount = 0
 end
 
@@ -436,21 +427,60 @@ local function txt(str, x, y, size)
 	glText(str, x, y, size, "no")
 end
 
+-- Marks the start of the draw frame. DrawGenesis fires after the sim Update()
+-- and before the world is rendered, so timing from here to DrawScreen captures
+-- draw-frame CPU only -- no sim/GameFrame, no vsync idle.
+function widget:DrawGenesis()
+	if profMode == MODE_OVERALL then
+		drawStartClock = spGetTimer()
+		drawStartValid = true
+	end
+end
+
 function widget:DrawScreen()
 	frameCount = frameCount + 1
 
-	if spDiffTimers(spGetTimer(), startTimer, nil, highres) >= tick then
+	-- "overall" mode: whole-frame GPU tail. We are layer -1000000 => drawn last,
+	-- so by now the engine's CWorldDrawer AND every widget have submitted all
+	-- their GL work. This glFinish blocks until the GPU drains it: ~0 when
+	-- CPU-bound, ~= total GPU frame time when GPU-bound. One finish/frame.
+	if profMode == MODE_OVERALL then
+		-- tA = all CPU submission for this draw frame is done (our DrawScreen is last)
+		local tA = spGetTimer()
+		if drawStartValid then
+			-- Frame CPU = work submitting GL calls: DrawGenesis (draw-frame start) .. now
+			drawCpuSum = drawCpuSum + spDiffTimers(tA, drawStartClock, nil, highres)
+			cpuFrames = cpuFrames + 1
+			drawStartValid = false
+		end
+		-- GPU tail = GPU work still outstanding once the CPU is done submitting
+		glFinish()
+		frameTailSum = frameTailSum + spDiffTimers(spGetTimer(), tA, nil, highres)
+	end
+
+	local dt = spDiffTimers(spGetTimer(), startTimer, nil, highres)
+	if dt >= tick then
 		startTimer = spGetTimer()
+		windowDt = dt
 		Flush()
 	end
 
 	local vsx, vsy = glGetViewSizes()
 	local fontSize = mathMax(11, mathFloor(vsy / 95))
 	local line = fontSize + 4
-	local x = mathFloor(vsx * 0.012)
-	local y = mathFloor(vsy * 0.86)
-	local colMs = x + fontSize * 16
-	local colHit = x + fontSize * 23
+	-- anchor x to the right of the minimap; keep y where it was
+	local mmx, _, mmw, _, mmMin, mmMax = spGetMiniMapGeometry()
+	local x
+	if mmx and not mmMin and not mmMax then
+		x = mathFloor(mmx + mmw + fontSize)
+	else
+		x = mathFloor(vsx * 0.012) -- fallback when minimap is hidden/maximized
+	end
+	local y = mathFloor(vsy * 0.9)
+	local colCpu = x + fontSize * 13
+	local colGpu = x + fontSize * 19
+	local colTot = x + fontSize * 25
+	local colHit = x + fontSize * 31
 
 	glColor(1, 1, 1, 1)
 	glBeginText()
@@ -477,59 +507,88 @@ function widget:DrawScreen()
 	end
 	y = y - line
 
-	txt(totals_colour .. stringFormat("FPS %d   mode: ", spGetFPS()) .. modeName[profMode]
-		.. "   \255\160\160\160/gpuprofiler [time|overdraw|off]", x, y, fontSize)
-	y = y - line
-
-	if profMode == MODE_TIME then
-		txt("\255\255\200\120glFinish active: frame times are INFLATED; compare widgets relative to each other", x, y, fontSize)
+	-- VRAM pressure / paging line
+	if evictSupported then
+		if paging then
+			glColor(1, 0.35, 0.25, 1)
+			txt(stringFormat("VRAM PRESSURE: paging  (%d evictions, %.0f MB/s) -- bad perf is from full VRAM", evictCountDelta, evictRateMBs), x, y, fontSize)
+		else
+			glColor(0.5, 0.85, 0.5, 1)
+			txt("VRAM pressure: none (driver not evicting)", x, y, fontSize)
+		end
+		glColor(1, 1, 1, 1)
+		y = y - line
+	elseif vramSupported and vramTotal > 0 and (vramUsed / vramTotal) > 0.95 then
+		glColor(1, 0.7, 0.2, 1)
+		txt("VRAM near full -- pressure likely (no eviction counter on this GPU)", x, y, fontSize)
+		glColor(1, 1, 1, 1)
 		y = y - line
 	end
 
-	-- ---- table header ----
-	y = y - mathFloor(line * 0.3)
-	txt(title_colour .. "widget", x, y, fontSize)
-	if profMode == MODE_OVERDRAW then
-		txt(title_colour .. "Msamp/f", colMs, y, fontSize)
-	else
-		txt(title_colour .. "GPU ms/f", colMs, y, fontSize)
-		txt(title_colour .. "heaviest", colHit, y, fontSize)
-	end
+	txt(totals_colour .. stringFormat("FPS %d   mode: ", spGetFPS()) .. modeName[profMode]
+		.. "   \255\160\160\160/gpuprofiler [overall|widget|off]", x, y, fontSize)
 	y = y - line
+	y = y - mathFloor(line * 0.3)
 
-	-- ---- rows ----
+	-- ---- body, per mode ----
 	if profMode == MODE_OFF then
 		txt(totals_colour .. "profiling paused", x, y, fontSize)
-	else
+
+	elseif profMode == MODE_OVERALL then
+		-- whole-frame CPU vs GPU (engine + widgets)
+		local heat = mathMin(1, frameGpuMs / 8.0)
+		txt(totals_colour .. stringFormat("Frame CPU: %.2f ms", frameCpuMs), x, y, fontSize)
+		glColor(1, 1 - 0.7 * heat, 1 - 0.7 * heat, 1)
+		txt(stringFormat("Frame GPU tail: %.2f ms", frameGpuMs), x + fontSize * 13, y, fontSize)
+		glColor(1, 1, 1, 1)
+		txt(title_colour .. stringFormat("total %.2f ms", frameWallMs), x + fontSize * 28, y, fontSize)
+		y = y - line
+		txt(totals_colour .. "  GPU ~0    => CPU-bound: GPU keeps up, look at CPU/sim (use Widget Profiler)", x, y, fontSize)
+		y = y - line
+		txt(totals_colour .. "  GPU high  => switch to 'widget' mode; if widgets are cheap it's the engine", x, y, fontSize)
+		y = y - line
+		txt(totals_colour .. "              (CWorldDrawer: terrain/units/particles/water) -> RenderDoc/Tracy", x, y, fontSize)
+		y = y - line
+		txt("\255\160\160\160  Frame CPU = work submitting GL calls (DrawGenesis..DrawScreen).", x, y, fontSize)
+		y = y - line
+		txt("\255\160\160\160  Frame GPU tail = GPU work left after submission. Both exclude sim & vsync idle.", x, y, fontSize)
+
+	else -- MODE_WIDGET
+		txt("\255\255\200\120glFinish active: frame times are INFLATED; compare widgets relative to each other", x, y, fontSize)
+		y = y - line
+		y = y - mathFloor(line * 0.3)
+
+		-- table header
+		txt(title_colour .. "widget", x, y, fontSize)
+		txt(title_colour .. "CPU ms/f", colCpu, y, fontSize)
+		txt(title_colour .. "GPU ms/f", colGpu, y, fontSize)
+		txt(title_colour .. "total", colTot, y, fontSize)
+		txt(title_colour .. "heaviest", colHit, y, fontSize)
+		y = y - line
+
+		-- rows
 		local rows = mathMin(maxRows, #displayList)
 		for i = 1, rows do
 			local d = displayList[i]
-			if profMode == MODE_OVERDRAW then
-				if d.samples < 1 then break end
-				glColor(1, 1, 1, 1)
-				txt(d.name, x, y, fontSize)
-				txt(stringFormat("%.2f", d.samples / 1.0e6), colMs, y, fontSize)
-			else
-				if d.ms < 0.005 then break end
-				-- redden the expensive ones
-				local heat = mathMin(1, d.ms / 2.0)
-				glColor(1, 1 - 0.7 * heat, 1 - 0.7 * heat, 1)
-				txt(d.name, x, y, fontSize)
-				txt(stringFormat("%.3f", d.ms), colMs, y, fontSize)
-				glColor(0.6, 0.6, 0.6, 1)
-				txt(d.heaviest, colHit, y, fontSize)
-			end
+			if d.ms < 0.005 then break end
+			-- redden the expensive ones (by GPU)
+			local heat = mathMin(1, d.ms / 2.0)
+			glColor(1, 1 - 0.7 * heat, 1 - 0.7 * heat, 1)
+			txt(d.name, x, y, fontSize)
+			txt(stringFormat("%.3f", d.ms), colGpu, y, fontSize)
+			glColor(0.6, 0.82, 1.0, 1) -- cpu in cyan to distinguish
+			txt(stringFormat("%.3f", d.cpu), colCpu, y, fontSize)
+			glColor(1, 1, 1, 1) -- total = cpu + gpu = (now - t0)
+			txt(stringFormat("%.3f", d.cpu + d.ms), colTot, y, fontSize)
+			glColor(0.6, 0.6, 0.6, 1)
+			txt(d.heaviest, colHit, y, fontSize)
 			y = y - line
 		end
 
 		-- totals
 		y = y - mathFloor(line * 0.3)
 		glColor(1, 1, 1, 1)
-		if profMode == MODE_OVERDRAW then
-			txt(totals_colour .. stringFormat("total %.2f Msamples/frame", totalSamples / 1.0e6), x, y, fontSize)
-		else
-			txt(totals_colour .. stringFormat("total %.3f GPU ms/frame (widget draws; serialized)", totalMs), x, y, fontSize)
-		end
+		txt(totals_colour .. stringFormat("total  CPU %.3f  /  GPU %.3f  /  sum %.3f  ms/frame (widget draws; serialized)", totalCpu, totalMs, totalCpu + totalMs), x, y, fontSize)
 	end
 
 	glColor(1, 1, 1, 1)
