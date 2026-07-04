@@ -72,6 +72,12 @@ local guishaderScreenDlists = {}
 local updateStencilTexture = false
 local updateStencilTextureScreen = false
 
+-- A/B test mode (engine GLFrameABCompare): each frame renders several passes; widgets
+-- rebuild dlists per pass, so stencil re-renders and queued dlist deletes must only run
+-- on the first pass or the blur/stencil state (and thus every blurred UI element)
+-- differs between compared passes. No-op in normal play (GetABDuplicatePass is false).
+local spGetABDuplicatePass = Spring.GetABDuplicatePass or function() return false end
+
 local oldvs = 0
 local vsx, vsy, vpx, vpy = spGetViewGeometry()
 local blurScale = 1
@@ -393,7 +399,7 @@ function widget:DrawScreenEffects() -- This blurs the world underneath UI elemen
 		glColor(1, 1, 1, 1)
 		glBlending(true)
 
-		if updateStencilTexture then
+		if updateStencilTexture and not spGetABDuplicatePass() then
 			DrawStencilTexture(true)
 			updateStencilTexture = false
 		end
@@ -433,7 +439,7 @@ local function DrawScreen() -- This blurs the UI elements obscured by other UI e
 		return
 	end
 
-	local numDelete = #deleteDlistQueue
+	local numDelete = spGetABDuplicatePass() and 0 or #deleteDlistQueue
 	if numDelete > 0 then
 		for i = 1, numDelete do
 			glDeleteList(deleteDlistQueue[i])
@@ -447,7 +453,7 @@ local function DrawScreen() -- This blurs the UI elements obscured by other UI e
 		glColor(1, 1, 1, 1)
 		glBlending(true)
 
-		if updateStencilTextureScreen then
+		if updateStencilTextureScreen and not spGetABDuplicatePass() then
 			DrawStencilTexture(false, screenBlur)
 			updateStencilTextureScreen = false
 		end

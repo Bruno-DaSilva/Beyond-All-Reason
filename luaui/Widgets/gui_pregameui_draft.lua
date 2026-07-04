@@ -1126,7 +1126,12 @@ function widget:DrawScreen()
 	-- DOM end
 
 	if gameStarting then
-		timer = timer + Spring.GetLastUpdateSeconds()
+		-- A/B test mode (GLFrameABCompare): DrawScreen runs once per compare pass, so a
+		-- per-DrawScreen advance can flip the blink color (233 vs 255) between passes of
+		-- the same frame. Only advance on the first pass; no-op in normal play.
+		if not (Spring.GetABDuplicatePass and Spring.GetABDuplicatePass()) then
+			timer = timer + Spring.GetLastUpdateSeconds()
+		end
 		local colorString = timer % 0.75 <= 0.375 and "\255\233\233\233" or "\255\255\255\255"
 		local text = colorString .. Spring.I18N('ui.initialSpawn.startCountdown', { time = mathMax(1, 3 - mathFloor(timer)) })
 		font:Begin()

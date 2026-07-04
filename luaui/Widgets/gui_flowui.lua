@@ -34,7 +34,11 @@ WG.FlowUI.tileScale = Spring.GetConfigFloat("ui_tilescale", 7)
 WG.FlowUI.tileSize = WG.FlowUI.tileScale
 
 -- Guishader display list lifecycle helpers
+-- A/B test mode (engine GLFrameABCompare): freeze the dlist lifecycle on repeat render
+-- passes -- rebuilding/deleting per pass would mutate the guishader stencil/dlist set
+-- between compared passes. No-op in normal play (GetABDuplicatePass is false).
 WG.FlowUI.guishaderCheckDlist = function(currentDlist, name, drawFn, force)
+	if Spring.GetABDuplicatePass and Spring.GetABDuplicatePass() then return currentDlist end
 	if WG['guishader'] then
 		if force and currentDlist then
 			currentDlist = gl.DeleteList(currentDlist)
@@ -51,6 +55,7 @@ WG.FlowUI.guishaderCheckDlist = function(currentDlist, name, drawFn, force)
 end
 
 WG.FlowUI.guishaderRemoveDlist = function(currentDlist, name)
+	if Spring.GetABDuplicatePass and Spring.GetABDuplicatePass() then return currentDlist end -- A/B test mode: freeze dlist lifecycle
 	if WG['guishader'] then
 		WG['guishader'].RemoveDlist(name)
 	end
@@ -61,6 +66,7 @@ WG.FlowUI.guishaderRemoveDlist = function(currentDlist, name)
 end
 
 WG.FlowUI.guishaderDeleteDlist = function(name)
+	if Spring.GetABDuplicatePass and Spring.GetABDuplicatePass() then return end -- A/B test mode: freeze dlist lifecycle
 	if WG['guishader'] then
 		WG['guishader'].DeleteDlist(name)
 	end
