@@ -46,10 +46,17 @@ local spGetViewGeometry = Spring.GetViewGeometry
 
 local ScreenCopy
 local lastScreenCopyFrame
+local lastScreenCopyPass
 
 
 local DepthCopy
 local lastDepthCopyFrame
+local lastDepthCopyPass
+
+-- Whole-frame A/B compare (engine GLFrameABCompare) renders the frame several times per
+-- draw frame with different GL backends; the copy must be redone per pass or a later
+-- pass would composite the previous backend's cached screen content.
+local spGetABPassIndex = Spring.GetABPassIndex or function() return 0 end
 
 local vsx, vsy, vpx, vpy = spGetViewGeometry()
 local firstCopy = true
@@ -81,10 +88,12 @@ end
 
 local function GetScreenCopy()
 	local df = Spring.GetDrawFrame()
+	local pass = spGetABPassIndex()
 	--spEcho("GetScreenCopy", df)
-	if df ~= lastScreenCopyFrame then
+	if df ~= lastScreenCopyFrame or pass ~= lastScreenCopyPass then
 		gl.CopyToTexture(ScreenCopy, 0, 0, vpx, vpy, vsx, vsy)
 		lastScreenCopyFrame = df
+		lastScreenCopyPass = pass
 	end
 	if firstCopy then
 		firstCopy = false
@@ -96,10 +105,12 @@ end
 
 local function GetDepthCopy()
 	local df = Spring.GetDrawFrame()
+	local pass = spGetABPassIndex()
 	--spEcho("GetScreenCopy", df)
-	if df ~= lastDepthCopyFrame then
+	if df ~= lastDepthCopyFrame or pass ~= lastDepthCopyPass then
 		gl.CopyToTexture(DepthCopy, 0, 0, vpx, vpy, vsx, vsy)
 		lastDepthCopyFrame = df
+		lastDepthCopyPass = pass
 	end
 	if firstCopy then
 		firstCopy = false

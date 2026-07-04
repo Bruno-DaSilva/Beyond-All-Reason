@@ -626,7 +626,16 @@ local function Bloom()
 	-- 3.5) Temporal smoothing: blend mip[1] (current) with historyTex (last frame),
 	--      then write the result back into both mip[1] (for combine) and historyTex.
 	local finalSrc = bloomMips[1].tex
-	if historyTex and temporalBlend > 0.0 and not debugBrightShader then
+	-- Whole-frame A/B "test mode": historyTex is a per-draw temporal feedback accumulator
+	-- (this frame's bloom blended over last frame's, written back every draw). Inside a
+	-- compare pair the write-back makes pass 2 blend against pass 1's freshly-written
+	-- history, so the composited bloom -- added to the entire screen -- diverges between the
+	-- two captured frames (a global ~1-LSB shift over ~60% of pixels during bright combat).
+	-- While a pair is in flight, bypass the history entirely and composite the freshly
+	-- computed current-frame bloom (bloomMips[1] is deterministic from the frozen scene), so
+	-- both passes are identical. No-op in normal play (GetABCompareActive is always false).
+	local abFreezeBloom = Spring.GetABCompareActive and Spring.GetABCompareActive()
+	if historyTex and temporalBlend > 0.0 and not debugBrightShader and not abFreezeBloom then
 		if historyValid then
 			gl.Blending(false)
 			blendShader:Activate()

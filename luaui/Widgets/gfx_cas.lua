@@ -250,6 +250,14 @@ function widget:ViewResize()
 end
 
 function widget:DrawScreenEffects()
+	-- Whole-frame A/B "test mode": CAS is a contrast-adaptive sharpen (a high-pass filter)
+	-- run on the shared, per-draw-deduped screen-copy. During a compare pair it amplifies
+	-- the tiny per-pass combat differences into whole-screen speckle (a ~1-LSB diff sharpened
+	-- to >1 across the frame), swamping the real divergence. Skip it while a pair is in flight
+	-- so both passes are compared un-sharpened -- CAS only amplifies differences, it never
+	-- creates them, so structural migration bugs still show in the un-sharpened image. No-op
+	-- in normal play (GetABCompareActive is always false there).
+	if Spring.GetABCompareActive and Spring.GetABCompareActive() then return end
 	--glCopyToTexture(screenCopyTex, 0, 0, vpx, vpy, vsx, vsy)
 	if WG['screencopymanager'] and WG['screencopymanager'].GetScreenCopy then
 		screenCopyTex = WG['screencopymanager'].GetScreenCopy()

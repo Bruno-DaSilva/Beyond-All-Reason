@@ -463,8 +463,15 @@ else	-- UNSYNCED
 		end
 	end
 
+	-- Whole-frame A/B compare (engine GLFrameABCompare) renders several passes per draw
+	-- frame; only account (and advance the smoothed averages) on the first pass, so the
+	-- overlay text is byte-identical across passes and the stats get one entry per frame.
+	local function isABRepeatPass()
+		return Spring.GetABDuplicatePass and Spring.GetABDuplicatePass()
+	end
+
 	function gadget:DrawGenesis() -- START OF DRAW
-		if benchmarkactive then
+		if benchmarkactive and not isABRepeatPass() then
 			local now = Spring.GetTimerMicros()
 			updateTime = Spring.DiffTimers(now, lastUpdateTimerUs)
 			benchmarkstats.updateFrameTimes[#benchmarkstats.updateFrameTimes + 1] = updateTime
@@ -474,7 +481,7 @@ else	-- UNSYNCED
 	end
 
 	function gadget:DrawScreenPost() -- END OF DRAW
-		if benchmarkactive then
+		if benchmarkactive and not isABRepeatPass() then
 			drawTime = Spring.DiffTimers(Spring.GetTimerMicros(), lastDrawTimerUS)
 			benchmarkstats.drawFrameTimes[#benchmarkstats.drawFrameTimes + 1] = drawTime
 			sd = alpha * sd + (1-alpha) * drawTime

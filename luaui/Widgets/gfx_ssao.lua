@@ -707,7 +707,11 @@ local function DoDrawSSAO()
 	local prevFBO
 
 	-- Gbuffer fuse pass: combine model + map depths
-	if ((shaderConfig.SLOWFUSE == 0) or spGetDrawFrame() % 30 == 0) and (noFuse ~= 1) then
+	-- With SLOWFUSE the fuse texture is retained across draw frames; freeze its periodic
+	-- update while a whole-frame A/B compare is active so every render pass of the frame
+	-- samples the identical retained state (SLOWFUSE=0 recomputes per pass, already safe).
+	local abCompareActive = Spring.GetABCompareActive and Spring.GetABCompareActive()
+	if ((shaderConfig.SLOWFUSE == 0) or (spGetDrawFrame() % 30 == 0 and not abCompareActive)) and (noFuse ~= 1) then
 		prevFBO = glRawBindFBO(gbuffFuseFBO)
 			gbuffFuseShader:Activate()
 				gbuffFuseShader:SetUniformMatrix("invProjMatrix", "projectioninverse")

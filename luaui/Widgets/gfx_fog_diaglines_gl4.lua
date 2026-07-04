@@ -195,12 +195,24 @@ end
 
 function widget:DrawGenesis()
 	if not coverageTex or not accumShader or not fullScreenQuadVAO then return end
+	-- Always initialise the coverage texture so it holds defined contents (an uninitialised
+	-- render texture can read back differently across two draws, which breaks A/B identity).
 	if needsClear then
 		gl.RenderToTexture(coverageTex, function()
 			gl.Clear(GL.COLOR_BUFFER_BIT, 0, 0, 0, 0)
 		end)
 		needsClear = false
 	end
+	-- Whole-frame A/B "test mode": the coverage accumulator is a render-to-texture blend
+	-- that is written here and then sampled the same frame by DrawWorldPreUnit. Under the
+	-- A/B compare (which redraws the same frozen sim state twice and diffs the two frames),
+	-- doing that write inside the captured frames makes the reference and duplicate passes
+	-- sample different accumulator state -> the diagonal lines diverge. Freeze the temporal
+	-- update while a compare pair is in flight so both passes sample the identical coverage.
+	-- No-op in normal play (GetABCompareActive is always false there); the accumulator has
+	-- already built real state during the pre-pair warmup window, and the pending update is
+	-- retained and applied once compares stop.
+	if Spring.GetABCompareActive and Spring.GetABCompareActive() then return end
 	if pendingUpdates > 0 then
 		updateAccumulator(pendingUpdates)
 		pendingUpdates = 0
