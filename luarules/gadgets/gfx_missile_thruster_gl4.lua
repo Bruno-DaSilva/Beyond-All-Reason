@@ -896,9 +896,14 @@ local function updateMissiles()
 		pausedCamRX, pausedCamRY, pausedCamRZ = dx, dy, dz
 	end
 
-	-- When idle (no missiles last check), throttle polling to every Nth draw frame
+	-- When idle (no missiles last check), throttle polling to every Nth draw frame.
+	-- Engine frame A/B compare: repeat render passes of the same frame must not
+	-- consume the throttle, or a missile launched while idle pops into existence
+	-- mid-pass-sequence (per-pass leak under the whole-frame compare gate).
 	if idleSkipCounter > 0 then
-		idleSkipCounter = idleSkipCounter - 1
+		if not (Spring.GetABDuplicatePass and Spring.GetABDuplicatePass()) then
+			idleSkipCounter = idleSkipCounter - 1
+		end
 		return
 	end
 
