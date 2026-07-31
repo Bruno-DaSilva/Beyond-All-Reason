@@ -106,17 +106,10 @@ local animCfg = {
 	toggleFadeDuration = 0.18,
 	-- Cluster identity matching: required overlap fraction (intersection / max(old,new))
 	identityMinOverlap = 0.34,
-	-- Alpha delta beyond which we recreate the gradient display list
-	rebuildThreshold = 0.0005,
 	-- Minimum relative change in cluster resource value to trigger a pulse
 	-- animation. Smaller changes (e.g. a single small wreck added/removed from
 	-- a large field) are ignored so the field only pulses on meaningful changes.
 	pulseMinRelativeChange = 0.12,
-	-- Per-frame budget for alpha-driven display-list rebuilds. The widget now
-	-- keeps this high enough that visible fades track camera motion closely.
-	maxRebuildsPerFrame = 64,
-	rebuildBudgetFrame = -1,
-	rebuildBudgetRemaining = 0,
 	-- High-quality font object (loaded in Initialize/ViewResize via WG['fonts'])
 	font = nil,
 }
@@ -150,11 +143,8 @@ local rad = math.rad
 local atan = math.atan
 local tan = math.tan
 
-local glBeginEnd = gl.BeginEnd
 local glBlending = gl.Blending
-local glCallList = gl.CallList
 local glColor = gl.Color
-local glCreateList = gl.CreateList
 local glDeleteList = gl.DeleteList
 local glDepthTest = gl.DepthTest
 local glLineWidth = gl.LineWidth
@@ -164,7 +154,11 @@ local glPushMatrix = gl.PushMatrix
 local glScale = gl.Scale
 local glText = gl.Text
 local glTranslate = gl.Translate
-local glVertex = gl.Vertex
+
+-- Hull rendering (see the block further down). One table rather than a local
+-- per helper: this file is already close to Lua's 200-local ceiling, and the
+-- fading-cluster cleanup above the block needs to free hull meshes.
+local hullGL = {}
 
 local spGetCameraPosition = Spring.GetCameraPosition
 local spGetFeaturePosition = Spring.GetFeaturePosition
@@ -755,8 +749,8 @@ animState.DeleteFadingCluster = function(uid, isEnergy)
 	local entry = fading[uid]
 	if not entry then return end
 	if entry.displayLists then
-		if entry.displayLists.gradient then glDeleteList(entry.displayLists.gradient) end
-		if entry.displayLists.edge then glDeleteList(entry.displayLists.edge) end
+		if entry.displayLists.gradient then hullGL.Delete(entry.displayLists.gradient) end
+		if entry.displayLists.edge then hullGL.Delete(entry.displayLists.edge) end
 		if entry.displayLists.text then glDeleteList(entry.displayLists.text) end
 		entry.displayLists = nil
 	end
@@ -2735,98 +2729,259 @@ end
 
 local camUpVector
 
-local function DrawHullVertices(hull)
-	for j = 1, #hull do
-		glVertex(hull[j].x, hull[j].y, hull[j].z)
-	end
-end
+--------------------------------------------------------------------------------
+-- Hull geometry
+--
+-- The hull fills used to be per-cluster display lists of gl.BeginEnd + glVertex
+-- + glColor, which made them the largest immediate-mode draw left in the game
+-- (measured: ~101 clusters and ~77k vertices per frame, so ~153k fixed-function
+-- calls every frame), and forced a full geometry rebuild whenever a cluster's
+-- fade alpha moved, because the alpha was baked into the recorded glColor.
+--
+-- Now the geometry goes into a per-cluster VBO once per SHAPE change, while the
+-- colour, both alphas, the fade and the pop-in scale are shader uniforms. A
+-- vertex carries only its position and an alpha selector (0 = fill alpha, 1 =
+-- gradient alpha), and the shader interpolates exactly what fixed function
+-- interpolated between the same two per-vertex colours.
+--
+-- This needs GL4 (VBO/VAO/shader); the widget disables itself if it cannot get
+-- them, as the other GL4 widgets do. A display-list fallback was tried and
+-- dropped: its alpha has to be baked into the geometry, so keeping it would
+-- have meant two different rebuild policies in one widget, and the fallback is
+-- precisely the path that could never be tested here.
+--
+-- Wrapped in a do block so the helpers below do not each occupy one of the main
+-- chunk's 200 local slots, which this file was already close to exhausting.
+--------------------------------------------------------------------------------
 
--- Pre-allocated energy colors table to avoid per-DL-creation allocation
-local energyGradientColors = {
-	fill = energyReclaimColor,
-	fillAlpha = fillAlpha * energyOpacityMultiplier,
-	gradientAlpha = gradientAlpha * energyOpacityMultiplier,
-}
+do
 
--- Reusable buffer for DrawHullVerticesGradient inner points
+local hullShader = nil
+-- reused inner ring, one entry per hull point
 local innerPointsBuf = {}
 
--- Draw gradient fill from center (transparent) to configurable radius (gradientAlpha)
--- Also fills the inner area with fillAlpha
-local function DrawHullVerticesGradient(hull, center, colors)
-	local hullCount = #hull
-	if hullCount < 3 then return end
+local hullVsSrc = [[
+#version 420
 
-	-- Use provided colors or default to metal colors
-	local reclaimCol = colors and colors.fill or reclaimColor
-	local r, g, b = reclaimCol[1], reclaimCol[2], reclaimCol[3]
+layout (location = 0) in vec4 posSel; // xyz = world position, w = alpha selector
+
+//__ENGINEUNIFORMBUFFERDEFS__
+
+uniform vec3 hullColor;
+uniform vec2 hullAlphas; // x = fill alpha, y = gradient alpha
+uniform vec4 hullAnim;   // xy = cluster centre xz, z = pop-in scale, w = y offset
+uniform float hullFog;   // 1 when fixed function would have fogged this draw
+
+out DataVS {
+	vec4 vColor;
+	float vFogF;
+};
+
+void main()
+{
+	// the pop-in animation was a modelview translate/scale/translate about the
+	// cluster centre that left y alone; hullAnim.w carries the caller's own
+	// modelview offset, which a cameraViewProj shader cannot otherwise see
+	vec3 wpos = posSel.xyz;
+	wpos.xz = hullAnim.xy + (wpos.xz - hullAnim.xy) * hullAnim.z;
+	wpos.y = wpos.y + hullAnim.w;
+
+	vColor = vec4(hullColor, mix(hullAlphas.x, hullAlphas.y, posSel.w));
+	// GL_LINEAR fog over eye-space depth, as fixed function applied it
+	vFogF = mix(1.0, (fogParams.y - abs((cameraView * vec4(wpos, 1.0)).z)) * fogParams.w, hullFog);
+
+	gl_Position = cameraViewProj * vec4(wpos, 1.0);
+}
+]]
+
+local hullFsSrc = [[
+#version 420
+
+//__ENGINEUNIFORMBUFFERDEFS__
+
+in DataVS {
+	vec4 vColor;
+	float vFogF;
+};
+
+out vec4 fragColor;
+
+void main()
+{
+	fragColor = vec4(mix(fogColor.rgb, vColor.rgb, clamp(vFogF, 0.0, 1.0)), vColor.a);
+}
+]]
+
+-- Both set by the draw pass rather than passed per call. fogActive comes from
+-- the live fixed-function state, so the shader fogs a hull exactly when the
+-- display lists used to be fogged; yOffset replaces the glTranslate the caller
+-- used to wrap the gradient layer in.
+hullGL.fogActive = 0
+hullGL.yOffset = 0
+
+function hullGL.Init()
+	local LuaShader = gl.LuaShader
+	if not gl.GetVBO or not gl.GetVAO or not LuaShader then return false end
+
+	local engineDefs = LuaShader.GetEngineUniformBufferDefs()
+	hullShader = LuaShader({
+		vertex = hullVsSrc:gsub("//__ENGINEUNIFORMBUFFERDEFS__", engineDefs),
+		fragment = hullFsSrc:gsub("//__ENGINEUNIFORMBUFFERDEFS__", engineDefs),
+		uniformFloat = {
+			hullColor = { 1, 1, 1 },
+			hullAlphas = { 1, 1 },
+			hullAnim = { 0, 0, 1, 0 },
+			hullFog = 0,
+		},
+	}, "Reclaim Field Highlight hulls")
+
+	if not hullShader:Initialize() then
+		hullShader = nil
+		return false
+	end
+	return true
+end
+
+-- A hull mesh is one VBO of {x, y, z, alphaSelector} plus its VAO. nil means it
+-- could not be allocated; callers then simply draw nothing for that cluster.
+local function HullMeshCreate(verts, numVerts)
+	if numVerts < 1 then return nil end
+
+	local vbo = gl.GetVBO(GL.ARRAY_BUFFER, false)
+	if not vbo then return nil end
+	vbo:Define(numVerts, { { id = 0, name = "posSel", size = 4 } })
+	vbo:Upload(verts, nil, 0, 1, numVerts * 4)
+
+	local vao = gl.GetVAO()
+	if not vao then
+		vbo:Delete()
+		return nil
+	end
+	vao:AttachVertexBuffer(vbo)
+
+	return { vao = vao, vbo = vbo, count = numVerts }
+end
+
+local function HullMeshDelete(mesh)
+	if not mesh then return end
+	if mesh.vao then mesh.vao:Delete() end
+	if mesh.vbo then mesh.vbo:Delete() end
+end
+
+-- Reused across builds: a hull rebuild is a shape change, not a per-frame event,
+-- and the upload is bounded by an explicit vertex count rather than by #buf.
+local gradientVertsBuf = {}
+local edgeVertsBuf = {}
+
+-- Inner ring (fill alpha) fanned from the centre, then a ring of quads out to
+-- the hull edge (gradient alpha). 9 vertices per hull point.
+local function BuildGradientVerts(hull, center)
+	local hullCount = #hull
+	if hullCount < 3 then return nil, 0 end
+
 	local cx, cy, cz = center.x, center.y, center.z
 	local innerRadius = gradientInnerRadius
 
-	-- Use custom alpha values if provided, otherwise use defaults
-	local fillAlphaValue = colors and colors.fillAlpha or fillAlpha
-	local gradientAlphaValue = colors and colors.gradientAlpha or gradientAlpha
-
-	-- Calculate the inner boundary using configurable radius
 	for i = 1, hullCount do
 		local hullPoint = hull[i]
-		local dx = hullPoint.x - cx
-		local dz = hullPoint.z - cz
 		local entry = innerPointsBuf[i]
 		if entry then
-			entry.x = cx + dx * innerRadius
+			entry.x = cx + (hullPoint.x - cx) * innerRadius
 			entry.y = hullPoint.y
-			entry.z = cz + dz * innerRadius
+			entry.z = cz + (hullPoint.z - cz) * innerRadius
 		else
 			innerPointsBuf[i] = {
-				x = cx + dx * innerRadius,
+				x = cx + (hullPoint.x - cx) * innerRadius,
 				y = hullPoint.y,
-				z = cz + dz * innerRadius
+				z = cz + (hullPoint.z - cz) * innerRadius
 			}
 		end
 	end
-	local innerPoints = innerPointsBuf
 
-	-- First, fill the inner area with solid fillAlpha (fan triangulation from center)
-	glColor(r, g, b, fillAlphaValue)
-	for j = 1, hullCount do
-		local nextIdx = (j == hullCount) and 1 or (j + 1)
-		local inner = innerPoints[j]
-		local innerNext = innerPoints[nextIdx]
-		glVertex(cx, cy, cz)
-		glVertex(inner.x, inner.y, inner.z)
-		glVertex(innerNext.x, innerNext.y, innerNext.z)
+	local buf = gradientVertsBuf
+	local k = 0
+	local function put(x, y, z, sel)
+		buf[k + 1] = x; buf[k + 2] = y; buf[k + 3] = z; buf[k + 4] = sel
+		k = k + 4
 	end
 
-	-- Then draw gradient triangles between inner (fillAlpha) and outer (gradientAlpha) rings
 	for j = 1, hullCount do
 		local nextIdx = (j == hullCount) and 1 or (j + 1)
-		local inner = innerPoints[j]
-		local innerNext = innerPoints[nextIdx]
+		local inner = innerPointsBuf[j]
+		local innerNext = innerPointsBuf[nextIdx]
+		put(cx, cy, cz, 0)
+		put(inner.x, inner.y, inner.z, 0)
+		put(innerNext.x, innerNext.y, innerNext.z, 0)
+	end
+
+	for j = 1, hullCount do
+		local nextIdx = (j == hullCount) and 1 or (j + 1)
+		local inner = innerPointsBuf[j]
+		local innerNext = innerPointsBuf[nextIdx]
 		local outer = hull[j]
 		local outerNext = hull[nextIdx]
 
-		-- Triangle 1: inner[j] -> outer[j] -> inner[next]
-		glColor(r, g, b, fillAlphaValue)
-		glVertex(inner.x, inner.y, inner.z)
+		put(inner.x, inner.y, inner.z, 0)
+		put(outer.x, outer.y, outer.z, 1)
+		put(innerNext.x, innerNext.y, innerNext.z, 0)
 
-		glColor(r, g, b, gradientAlphaValue)
-		glVertex(outer.x, outer.y, outer.z)
+		put(innerNext.x, innerNext.y, innerNext.z, 0)
+		put(outer.x, outer.y, outer.z, 1)
+		put(outerNext.x, outerNext.y, outerNext.z, 1)
+	end
 
-		glColor(r, g, b, fillAlphaValue)
-		glVertex(innerNext.x, innerNext.y, innerNext.z)
+	return buf, k / 4
+end
 
-		-- Triangle 2: inner[next] -> outer[j] -> outer[next]
-		glColor(r, g, b, fillAlphaValue)
-		glVertex(innerNext.x, innerNext.y, innerNext.z)
+local function BuildEdgeVerts(hull)
+	local hullCount = #hull
+	local buf = edgeVertsBuf
+	for j = 1, hullCount do
+		local p = hull[j]
+		local o = (j - 1) * 4
+		buf[o + 1] = p.x; buf[o + 2] = p.y; buf[o + 3] = p.z; buf[o + 4] = 0
+	end
+	return buf, hullCount
+end
 
-		glColor(r, g, b, gradientAlphaValue)
-		glVertex(outer.x, outer.y, outer.z)
+function hullGL.CreateGradient(hull, center)
+	local verts, numVerts = BuildGradientVerts(hull, center)
+	if not verts then return nil end
+	return HullMeshCreate(verts, numVerts)
+end
 
-		glColor(r, g, b, gradientAlphaValue)
-		glVertex(outerNext.x, outerNext.y, outerNext.z)
+function hullGL.CreateEdge(hull)
+	local verts, numVerts = BuildEdgeVerts(hull)
+	if numVerts < 2 then return nil end
+	return HullMeshCreate(verts, numVerts)
+end
+
+hullGL.Delete = HullMeshDelete
+
+-- The colour, both alphas and the pop-in transform are per-DRAW and never baked
+-- into the geometry: that is what lets a fade or a pop-in animate without
+-- touching the VBO. animScale == 1 means the cluster is not animating, and an
+-- edge draw passes its one colour as both alphas.
+function hullGL.Draw(geom, primitive, r, g, b, fillA, gradA, center, animScale)
+	if not geom then return end
+
+	hullShader:Activate()
+	hullShader:SetUniform("hullColor", r, g, b)
+	hullShader:SetUniform("hullAlphas", fillA, gradA)
+	hullShader:SetUniform("hullAnim", center.x, center.z, animScale, hullGL.yOffset)
+	hullShader:SetUniform("hullFog", hullGL.fogActive)
+	geom.vao:DrawArrays(primitive, geom.count)
+	hullShader:Deactivate()
+end
+
+function hullGL.Shutdown()
+	if hullShader then
+		hullShader:Delete()
+		hullShader = nil
 	end
 end
+
+end -- hull geometry
 
 -- Helper functions for per-cluster display list management
 DeleteClusterDisplayList = function(cid, isEnergy, keepText)
@@ -2837,11 +2992,11 @@ DeleteClusterDisplayList = function(cid, isEnergy, keepText)
 	local clusterData = displayLists[cid]
 	if clusterData then
 		if clusterData.gradient then
-			glDeleteList(clusterData.gradient)
+			hullGL.Delete(clusterData.gradient)
 			clusterData.gradient = nil
 		end
 		if clusterData.edge then
-			glDeleteList(clusterData.edge)
+			hullGL.Delete(clusterData.edge)
 			clusterData.edge = nil
 		end
 		if not keepText then
@@ -2860,7 +3015,7 @@ DeleteClusterDisplayList = function(cid, isEnergy, keepText)
 	stateHashes[cid] = nil
 end
 
-CreateClusterDisplayList = function(cid, isEnergy, alphaMult)
+CreateClusterDisplayList = function(cid, isEnergy)
 	local displayLists = isEnergy and energyClusterDisplayLists or clusterDisplayLists
 	local clusters = isEnergy and energyFeatureClusters or featureClusters
 	local hulls = isEnergy and energyFeatureConvexHulls or featureConvexHulls
@@ -2872,20 +3027,11 @@ CreateClusterDisplayList = function(cid, isEnergy, alphaMult)
 		return
 	end
 
-	alphaMult = alphaMult or 1.0
-	if alphaMult < 0 then alphaMult = 0 end
-	if alphaMult > 1 then alphaMult = 1 end
-
-	-- Compute geometry hash (alpha-independent) plus a full hash with quantized
-	-- alpha, so the gradient rebuilds on fade while the edge list can be reused.
+	-- Colour and alpha are draw-time uniforms now, so the only thing that can
+	-- invalidate a cluster's geometry is its SHAPE, and a fade rebuilds nothing.
 	local geomHash = ComputeClusterStateHash(cluster, hull)
-	-- Quantize alpha to ~16 buckets so we don't rebuild every tiny change
-	local newHash = geomHash + floor(alphaMult * 16 + 0.5) * 0.0001
-	local oldHash = stateHashes[cid]
-
-	-- Only recreate if state actually changed
-	if oldHash and oldHash == newHash then
-		return -- No change, keep existing display list
+	if stateHashes[cid] == geomHash then
+		return
 	end
 
 	-- Prepare clusterData table; if it exists preserve text (we'll recreate geometry only)
@@ -2894,71 +3040,26 @@ CreateClusterDisplayList = function(cid, isEnergy, alphaMult)
 		clusterData = {}
 		displayLists[cid] = clusterData
 	else
-		-- Remove the existing gradient list (alpha is baked in, so it always
-		-- rebuilds). The edge list is shape-only and is rebuilt below only when
-		-- the geometry actually changed.
 		if clusterData.gradient then
-			glDeleteList(clusterData.gradient)
+			hullGL.Delete(clusterData.gradient)
 			clusterData.gradient = nil
+		end
+		if clusterData.edge then
+			hullGL.Delete(clusterData.edge)
+			clusterData.edge = nil
 		end
 	end
 
-	-- Build a colors table with alpha baked in
-	local colorsTbl
-	if isEnergy then
-		colorsTbl = {
-			fill = energyReclaimColor,
-			fillAlpha = fillAlpha * energyOpacityMultiplier * alphaMult,
-			gradientAlpha = gradientAlpha * energyOpacityMultiplier * alphaMult,
-		}
-	else
-		colorsTbl = {
-			fill = reclaimColor,
-			fillAlpha = fillAlpha * alphaMult,
-			gradientAlpha = gradientAlpha * alphaMult,
-		}
-	end
-
-	-- Capture immutable values into locals so the display list closure doesn't
-	-- pick up later mutations of the shared colorsTbl.
-	local capturedFillAlpha = colorsTbl.fillAlpha
-	local capturedGradientAlpha = colorsTbl.gradientAlpha
-	local capturedFill = colorsTbl.fill
-	-- We allocate a per-list colors table to avoid the shared table being
-	-- mutated before the list is actually executed.
-	local listColors = {
-		fill = capturedFill,
-		fillAlpha = capturedFillAlpha,
-		gradientAlpha = capturedGradientAlpha,
-	}
-
-	-- Create gradient fill display list (alpha baked in)
-	clusterData.gradient = glCreateList(function()
-		glBeginEnd(GL.TRIANGLES, DrawHullVerticesGradient, hull, cluster.center, listColors)
-	end)
-
-	-- Create the edge display list only when the geometry actually changed; its
-	-- opacity is applied via glColor at draw time, so alpha-only fades reuse it.
-	if not clusterData.edge or clusterData.geomHash ~= geomHash then
-		if clusterData.edge then glDeleteList(clusterData.edge) end
-		clusterData.edge = glCreateList(function()
-			glBeginEnd(GL.LINE_LOOP, DrawHullVertices, hull)
-		end)
-		clusterData.geomHash = geomHash
-	end
-
-	-- Track the alpha used for the current gradient list so we can decide later
-	-- whether to rebuild on subsequent fade ticks.
-	clusterData.bakedAlpha = alphaMult
+	clusterData.gradient = hullGL.CreateGradient(hull, cluster.center)
+	clusterData.edge = hullGL.CreateEdge(hull)
 
 	displayLists[cid] = clusterData
-
-	-- Update state hash after successful recreation
-	stateHashes[cid] = newHash
+	stateHashes[cid] = geomHash
 end
 
 -- Build (or rebuild) display lists for a single fading-out cluster entry.
--- Bakes the entry's current alpha into the gradient list so we get a real fade.
+-- The hull is frozen for the life of the fade and the alpha is a draw-time
+-- uniform, so this runs exactly once per fading entry.
 local function CreateFadingClusterDisplayList(uid, isEnergy)
 	local fading = isEnergy and animState.fadingEnergy or animState.fading
 	local entry = fading[uid]
@@ -2967,44 +3068,18 @@ local function CreateFadingClusterDisplayList(uid, isEnergy)
 	local center = entry.center
 	if not hull or #hull < 3 or not center then return end
 
-	local alphaMult = entry.alpha or entry.startAlpha or 1
-	if alphaMult < 0 then alphaMult = 0 end
-	if alphaMult > 1 then alphaMult = 1 end
-
-	-- Reuse table if present; otherwise allocate
 	local dl = entry.displayLists
 	if not dl then
 		dl = {}
 		entry.displayLists = dl
 	end
-	if dl.gradient then glDeleteList(dl.gradient); dl.gradient = nil end
 
-	local listColors
-	if isEnergy then
-		listColors = {
-			fill = energyReclaimColor,
-			fillAlpha = fillAlpha * energyOpacityMultiplier * alphaMult,
-			gradientAlpha = gradientAlpha * energyOpacityMultiplier * alphaMult,
-		}
-	else
-		listColors = {
-			fill = reclaimColor,
-			fillAlpha = fillAlpha * alphaMult,
-			gradientAlpha = gradientAlpha * alphaMult,
-		}
+	if not dl.gradient then
+		dl.gradient = hullGL.CreateGradient(hull, center)
 	end
-
-	dl.gradient = glCreateList(function()
-		glBeginEnd(GL.TRIANGLES, DrawHullVerticesGradient, hull, center, listColors)
-	end)
-	-- Edge geometry is fixed for the life of the fade; build it once and reuse
-	-- it across every alpha tick (opacity comes from glColor at draw time).
 	if not dl.edge then
-		dl.edge = glCreateList(function()
-			glBeginEnd(GL.LINE_LOOP, DrawHullVertices, hull)
-		end)
+		dl.edge = hullGL.CreateEdge(hull)
 	end
-	entry.lastBakedAlpha = alphaMult
 end
 
 local cachedCameraFacing = 0
@@ -3386,6 +3461,12 @@ end
 -- Widget call-ins
 
 function widget:Initialize()
+	if not hullGL.Init() then
+		Spring.Echo("Reclaim Field Highlight: could not create the hull shader, disabling")
+		widgetHandler:RemoveWidget()
+		return
+	end
+
 	gameStarted = Spring.GetGameFrame() > 0
 	showResourceIcons = Spring.GetModOptions().scenariooptions ~= nil
 	screenx, screeny = widgetHandler:GetViewSizes()
@@ -3542,6 +3623,8 @@ function widget:Shutdown()
 	for uid in pairs(animState.fadingEnergy) do
 		animState.DeleteFadingCluster(uid, true)
 	end
+
+	hullGL.Shutdown()
 
 	-- Clean up old monolithic display lists (for compatibility)
 	if drawFeatureConvexHullGradientList ~= nil then
@@ -3724,65 +3807,24 @@ local function DrawLiveCluster(cid, isEnergy, drawGradient)
 		clusterData = clusterDisplayLists[cid]
 	end
 	if drawGradient then
-		local needRebuild = false
-		local mustRebuild = false
+		-- Only a missing mesh forces a build now: a fade is a uniform change, so
+		-- there is nothing left for the old per-frame rebuild budget to ration.
 		if not clusterData or not clusterData.gradient then
-			needRebuild = true
-			mustRebuild = true -- nothing to draw yet, must build geometry now
-		elseif not clusterData.bakedAlpha or abs(effAlpha - clusterData.bakedAlpha) > animCfg.rebuildThreshold then
-			needRebuild = true
-		end
-		if needRebuild then
-			-- Refresh the per-frame rebuild budget on the first request this frame.
-			if animCfg.rebuildBudgetFrame ~= drawCounter then
-				animCfg.rebuildBudgetFrame = drawCounter
-				animCfg.rebuildBudgetRemaining = animCfg.maxRebuildsPerFrame
-			end
-			-- Optional (alpha-only) rebuilds are budget-gated; over budget we
-			-- reuse the existing list this frame and catch up later.
-			if mustRebuild or animCfg.rebuildBudgetRemaining > 0 then
-				if not mustRebuild then
-					animCfg.rebuildBudgetRemaining = animCfg.rebuildBudgetRemaining - 1
-				end
-				if isEnergy then energyClusterStateHashes[cid] = nil else clusterStateHashes[cid] = nil end
-				CreateClusterDisplayList(cid, isEnergy, effAlpha)
-				clusterData = isEnergy and energyClusterDisplayLists[cid] or clusterDisplayLists[cid]
-			end
+			CreateClusterDisplayList(cid, isEnergy)
+			clusterData = isEnergy and energyClusterDisplayLists[cid] or clusterDisplayLists[cid]
 		end
 		if clusterData and clusterData.gradient then
-			if animScale ~= 1 then
-				local center = cluster.center
-				local cx, cz = center.x, center.z
-				glPushMatrix()
-				glTranslate(cx, 0, cz)
-				glScale(animScale, 1, animScale)
-				glTranslate(-cx, 0, -cz)
-				glCallList(clusterData.gradient)
-				glPopMatrix()
-			else
-				glCallList(clusterData.gradient)
-			end
+			local col = isEnergy and energyReclaimColor or reclaimColor
+			local mult = isEnergy and (energyOpacityMultiplier * effAlpha) or effAlpha
+			hullGL.Draw(clusterData.gradient, GL.TRIANGLES, col[1], col[2], col[3],
+				fillAlpha * mult, gradientAlpha * mult, cluster.center, animScale)
 		end
 	else
 		if clusterData and clusterData.edge then
 			local edgeCol = isEnergy and energyReclaimEdgeColor or reclaimEdgeColor
-			if isEnergy then
-				glColor(edgeCol[1], edgeCol[2], edgeCol[3], edgeCol[4] * energyOpacityMultiplier * effAlpha)
-			else
-				glColor(edgeCol[1], edgeCol[2], edgeCol[3], edgeCol[4] * effAlpha)
-			end
-			if animScale ~= 1 then
-				local center = cluster.center
-				local cx, cz = center.x, center.z
-				glPushMatrix()
-				glTranslate(cx, 0, cz)
-				glScale(animScale, 1, animScale)
-				glTranslate(-cx, 0, -cz)
-				glCallList(clusterData.edge)
-				glPopMatrix()
-			else
-				glCallList(clusterData.edge)
-			end
+			local a = isEnergy and (edgeCol[4] * energyOpacityMultiplier * effAlpha) or (edgeCol[4] * effAlpha)
+			hullGL.Draw(clusterData.edge, GL.LINE_LOOP, edgeCol[1], edgeCol[2], edgeCol[3],
+				a, a, cluster.center, animScale)
 		end
 	end
 	return effAlpha
@@ -3796,37 +3838,27 @@ local function DrawFadingCluster(uid, entry, drawGradient)
 	local inView = IsInCameraView(center.x, center.y, center.z, 600, drawCounter)
 	if not inView then return end
 
+	local isEnergy = entry.isEnergy
+
 	if drawGradient then
 		local dl = entry.displayLists
-		local mustRebuild = not dl or not dl.gradient
-		local wantRebuild = mustRebuild
-			or not entry.lastBakedAlpha or abs(alpha - entry.lastBakedAlpha) > animCfg.rebuildThreshold
-		if wantRebuild then
-			if animCfg.rebuildBudgetFrame ~= drawCounter then
-				animCfg.rebuildBudgetFrame = drawCounter
-				animCfg.rebuildBudgetRemaining = animCfg.maxRebuildsPerFrame
-			end
-			if mustRebuild or animCfg.rebuildBudgetRemaining > 0 then
-				if not mustRebuild then
-					animCfg.rebuildBudgetRemaining = animCfg.rebuildBudgetRemaining - 1
-				end
-				CreateFadingClusterDisplayList(uid, entry.isEnergy)
-				dl = entry.displayLists
-			end
+		if not dl or not dl.gradient then
+			CreateFadingClusterDisplayList(uid, isEnergy)
+			dl = entry.displayLists
 		end
 		if dl and dl.gradient then
-			glCallList(dl.gradient)
+			local col = isEnergy and energyReclaimColor or reclaimColor
+			local mult = isEnergy and (energyOpacityMultiplier * alpha) or alpha
+			hullGL.Draw(dl.gradient, GL.TRIANGLES, col[1], col[2], col[3],
+				fillAlpha * mult, gradientAlpha * mult, center, 1)
 		end
 	else
 		local dl = entry.displayLists
 		if dl and dl.edge then
-			local edgeCol = entry.isEnergy and energyReclaimEdgeColor or reclaimEdgeColor
-			if entry.isEnergy then
-				glColor(edgeCol[1], edgeCol[2], edgeCol[3], edgeCol[4] * energyOpacityMultiplier * alpha)
-			else
-				glColor(edgeCol[1], edgeCol[2], edgeCol[3], edgeCol[4] * alpha)
-			end
-			glCallList(dl.edge)
+			local edgeCol = isEnergy and energyReclaimEdgeColor or reclaimEdgeColor
+			local a = isEnergy and (edgeCol[4] * energyOpacityMultiplier * alpha) or (edgeCol[4] * alpha)
+			hullGL.Draw(dl.edge, GL.LINE_LOOP, edgeCol[1], edgeCol[2], edgeCol[3],
+				a, a, center, 1)
 		end
 	end
 end
@@ -4113,13 +4145,17 @@ function widget:DrawWorldPreUnit()
 	glBlending(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
 	glLineWidth((1 + ((vsy / 1440) * 2.5)) / cameraScale)
 
+	-- The hull draws transform by cameraViewProj and so cannot see the fixed
+	-- function state the display lists used to inherit: the gradient layer's
+	-- 1-elmo drop and the fog enable go to the shader instead.
+	hullGL.fogActive = gl.GetFixedState("fog") and 1 or 0
+
 	local tVis0 = debugTiming and osClock() or 0
 
 	-- Draw metal fields (gradient + edge)
 	if showMetal then
 		-- Gradient layer (pushed down by 1 unit)
-		glPushMatrix()
-		glTranslate(0, -1, 0)
+		hullGL.yOffset = -1
 		for cid = 1, #featureClusters do
 			DrawLiveCluster(cid, false, true)
 		end
@@ -4127,7 +4163,7 @@ function widget:DrawWorldPreUnit()
 		for uid, entry in pairs(animState.fading) do
 			DrawFadingCluster(uid, entry, true)
 		end
-		glPopMatrix()
+		hullGL.yOffset = 0
 
 		-- Edge layer (reuse cached visibility from gradient pass)
 		for cid = 1, #featureClusters do
@@ -4140,15 +4176,14 @@ function widget:DrawWorldPreUnit()
 
 	-- Draw energy fields (gradient + edge)
 	if showEnergy then
-		glPushMatrix()
-		glTranslate(0, -1, 0)
+		hullGL.yOffset = -1
 		for cid = 1, #energyFeatureClusters do
 			DrawLiveCluster(cid, true, true)
 		end
 		for uid, entry in pairs(animState.fadingEnergy) do
 			DrawFadingCluster(uid, entry, true)
 		end
-		glPopMatrix()
+		hullGL.yOffset = 0
 
 		for cid = 1, #energyFeatureClusters do
 			DrawLiveCluster(cid, true, false)
