@@ -537,18 +537,21 @@ local function DrawIcosahedron(subd, cw)
 		faces = newfaces
 	end
 
+	-- No gl.Normal: ShieldSphereColor.vert reads gl_Vertex and never gl_Normal,
+	-- and the draw is shader-bound with no fixed-function lighting, so the
+	-- normals were dead. They were also this game's only gl.Normal caller, and
+	-- glNormal3f cannot be recorded into a command list -- so emitting them
+	-- forced both of these lists to compile as real GL display lists, which
+	-- disables RenderDoc capture for the whole process.
 	gl.BeginEnd(GL.TRIANGLES, function()
 		for _, face in ipairs(faces) do
 			gl.TexCoord(GetSphericalUV(face[1]))
-			gl.Normal(face[1][1], face[1][2], face[1][3])
 			gl.Vertex(face[1][1], face[1][2], face[1][3])
 
 			gl.TexCoord(GetSphericalUV(face[2]))
-			gl.Normal(face[2][1], face[2][2], face[2][3])
 			gl.Vertex(face[2][1], face[2][2], face[2][3])
 
 			gl.TexCoord(GetSphericalUV(face[3]))
-			gl.Normal(face[3][1], face[3][2], face[3][3])
 			gl.Vertex(face[3][1], face[3][2], face[3][3])
 		end
 	end)
