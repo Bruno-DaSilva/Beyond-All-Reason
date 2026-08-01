@@ -296,6 +296,21 @@ local function CreateShaders()
 
     -- create blur shaders
     blurShader = gl.CreateShader({
+        -- Spells out what fixed-function vertex processing was doing implicitly.
+        -- With no vertex shader gl_TexCoord[0] came from fixed function, so
+        -- gl.TexRect had to deliver it through immediate mode -- and one glBegin
+        -- anywhere, loading screen included, disables RenderDoc capture for the
+        -- whole process. Same transform, same texcoord, just stated.
+        vertex = [[
+		#version 150 compatibility
+
+        void main(void)
+        {
+            gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+            gl_TexCoord[0] = gl_TextureMatrix[0] * gl_MultiTexCoord0;
+        }
+    ]],
+
         fragment = [[
 		#version 150 compatibility
         uniform sampler2D tex2;

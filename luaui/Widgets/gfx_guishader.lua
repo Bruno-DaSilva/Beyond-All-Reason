@@ -319,7 +319,24 @@ local function CreateShaders()
 		]]
 	end
 
+	-- Spells out what fixed-function vertex processing was doing implicitly.
+	-- With no vertex shader the blur quad's gl_TexCoord[0] came from fixed
+	-- function, so gl.TexRect had to deliver it through immediate mode -- and one
+	-- glBegin anywhere disables RenderDoc capture for the whole process. Same
+	-- transform and same texcoord (texture matrix included, as fixed function
+	-- applies it), just stated.
+	local vertexShaderCode = [[
+	#version 120
+
+	void main(void)
+	{
+		gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+		gl_TexCoord[0] = gl_TextureMatrix[0] * gl_MultiTexCoord0;
+	}
+	]]
+
 	blurShader = LuaShader({
+		vertex = vertexShaderCode,
 		fragment = fragmentShaderCode,
 
 		uniformInt = {
