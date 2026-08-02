@@ -90,6 +90,22 @@ local outlineColor = { 0.0, 0.0, 0.0, 0 }
 
 
 
+-- Spells out what fixed-function vertex processing was doing implicitly. A
+-- fragment-only program has no vertex stage the engine's modern backend can
+-- feed, so its gl.TexRect had to be delivered through immediate mode -- and one
+-- glBegin anywhere disables RenderDoc capture for the whole process (measured:
+-- pausing the game killed an otherwise-clean capture). Same transform and same
+-- texcoord (texture matrix included, as fixed function applies it), just stated.
+local vertexShaderSource = [[
+	#version 120
+
+	void main(void)
+	{
+		gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+		gl_TexCoord[0] = gl_TextureMatrix[0] * gl_MultiTexCoord0;
+	}
+]]
+
 --intensity formula based on http://alienryderflex.com/hsp.html
 local fragmentShaderSource = [[
 	#version 150 compatibility
@@ -257,6 +273,7 @@ function widget:Initialize()
 	if gl.CreateShader then
 		shaderProgram = gl.CreateShader(
 			{
+				vertex = vertexShaderSource,
 				fragment = fragmentShaderSource,
 				uniformInt = {
 					screencopy = 0,
