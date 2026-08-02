@@ -16595,16 +16595,26 @@ function widget:DrawScreen()
 		local dynamicUpdateRate = CalculateDynamicUpdateRate()
 		local pipUpdateInterval = dynamicUpdateRate > 0 and (1 / dynamicUpdateRate) or 0
 
+		-- Whole-frame A/B compare (engine GLFrameABCompare) renders the frame
+		-- several times per draw frame; the texture updates below throttle on
+		-- WALL time (os.clock), so they fire in whichever repeat pass crosses the
+		-- interval and the compared passes see different texture content. Update
+		-- only on the first pass; repeats draw the same textures. No-op in normal
+		-- play (GetABDuplicatePass is false).
+		local abDuplicatePass = Spring.GetABDuplicatePass and Spring.GetABDuplicatePass()
+
 		-- Decrement the force-refresh counter (grace period after ViewResize / preset change)
-		if pipR2T.forceRefreshFrames > 0 then
+		if pipR2T.forceRefreshFrames > 0 and not abDuplicatePass then
 			pipR2T.forceRefreshFrames = pipR2T.forceRefreshFrames - 1
 		end
 
-		-- Update LOS texture
-		UpdateLOSTexture(currentTime)
+		if not abDuplicatePass then
+			-- Update LOS texture
+			UpdateLOSTexture(currentTime)
 
-		-- Update decal overlay texture (~once per second, game-frame based)
-		UpdateDecalTexture()
+			-- Update decal overlay texture (~once per second, game-frame based)
+			UpdateDecalTexture()
+		end
 
 		-- Force immediate units re-render when fullview state changes.
 		-- The main transition detection code (below) runs AFTER UpdateR2TUnits,
@@ -16631,11 +16641,15 @@ function widget:DrawScreen()
 		-- Update oversized units texture at throttled rate (expensive layers)
 		local drawStartTime = os.clock()
 		local prevUnitsTime = pipR2T.unitsLastUpdateTime
-		UpdateR2TUnits(currentTime, pipUpdateInterval, pipWidth, pipHeight)
+		if not abDuplicatePass then
+			UpdateR2TUnits(currentTime, pipUpdateInterval, pipWidth, pipHeight)
+		end
 
 		-- Update oversized cheap layers texture at throttled rate
 		local prevContentTime = pipR2T.contentLastUpdateTime
-		UpdateR2TCheapLayers(currentTime, pipUpdateInterval, pipWidth, pipHeight)
+		if not abDuplicatePass then
+			UpdateR2TCheapLayers(currentTime, pipUpdateInterval, pipWidth, pipHeight)
+		end
 
 		-- Only record draw time when actual rendering occurred (not throttled no-ops)
 		local didRender = pipR2T.unitsLastUpdateTime ~= prevUnitsTime or pipR2T.contentLastUpdateTime ~= prevContentTime

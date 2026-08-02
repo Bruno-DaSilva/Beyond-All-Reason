@@ -18,6 +18,13 @@ end
 -- Localized Spring API for performance
 local spGetGameFrame = Spring.GetGameFrame
 
+-- Whole-frame A/B compare (engine GLFrameABCompare) renders the frame several
+-- times; advancing the cache position per DrawScreen invocation would cache
+-- DIFFERENT icons each pass, and the engine's on-demand buildpic render dirties
+-- the framebuffer corner, which reads as a pass-varying 128x128 divergence.
+-- No-op in normal play (GetABDuplicatePass is false).
+local spGetABDuplicatePass = Spring.GetABDuplicatePass or function() return false end
+
 local iconTypes = VFS.Include("gamedata/icontypes.lua")
 local vsx, vsy = Spring.GetViewGeometry()
 local delayedCacheUnitIcons
@@ -84,6 +91,10 @@ function widget:Initialize()
 end
 
 function widget:DrawScreen()
+	if spGetABDuplicatePass() then
+		return
+	end
+
 	-- Cache start units and setup delayed caching (only at game frame 0)
 	if not cachedUnitIcons then
 		if spGetGameFrame() == 0 then
